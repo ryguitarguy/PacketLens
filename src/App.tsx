@@ -18,7 +18,9 @@ import {
   FileWarning, 
   Loader2, 
   HardDrive,
-  FolderOpen
+  FolderOpen,
+  Play,
+  ArrowRight
 } from 'lucide-react';
 
 export function App() {
@@ -26,10 +28,11 @@ export function App() {
   const [currentBuffer, setCurrentBuffer] = useState<ArrayBuffer | null>(null);
   const [activeTab, setActiveTab] = useState<'unencrypted' | 'anomalies' | 'traffic' | 'packets'>('unencrypted');
   const [selectedPacketId, setSelectedPacketId] = useState<number | undefined>(undefined);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
+  const landingFileInputRef = React.useRef<HTMLInputElement>(null);
 
   // Process raw PCAP ArrayBuffer through parsing and analytics engines
   const processPcapBuffer = useCallback((buffer: ArrayBuffer, filename: string) => {
@@ -70,12 +73,13 @@ export function App() {
     }
   }, []);
 
-  // Initial load: populate with realistic default forensic sample
-  useEffect(() => {
-    const defaultSample = SAMPLE_PCAPS[0];
-    const buf = defaultSample.generate();
-    processPcapBuffer(buf, 'audit_credentials_leak.pcap');
-  }, [processPcapBuffer]);
+  // Clear current capture and return to scenario picker
+  const handleClearCapture = () => {
+    setAnalysisResult(null);
+    setCurrentBuffer(null);
+    setSelectedPacketId(undefined);
+    setErrorMessage(null);
+  };
 
   // Load a chosen sample
   const handleSelectSample = (sampleId: string) => {
@@ -164,12 +168,14 @@ export function App() {
         packetCount={analysisResult?.parsedPackets.length || 0}
         unencryptedCount={analysisResult?.cleartextItems.length || 0}
         anomalyCount={analysisResult?.anomalies.length || 0}
+        hasCapture={Boolean(analysisResult)}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         onFileUpload={handleFileUpload}
         onSelectSample={handleSelectSample}
         onExportReport={() => setIsExportModalOpen(true)}
         onDownloadCurrentPcap={handleDownloadPcap}
+        onClearCapture={handleClearCapture}
       />
 
       {/* Main Content Area */}
@@ -177,15 +183,24 @@ export function App() {
         
         {/* Error Notification */}
         {errorMessage && (
-          <div className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-start gap-3 text-rose-300 text-xs">
-            <FileWarning className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-bold text-sm">Failed to parse packet capture</p>
-              <p className="mt-0.5">{errorMessage}</p>
-              <p className="mt-2 text-slate-400">
-                Ensure the file is a valid standard PCAP or PCAPNG file. You can load one of the built-in forensic sample captures using the &quot;Samples&quot; menu above.
-              </p>
+          <div className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-start justify-between gap-3 text-rose-300 text-xs">
+            <div className="flex items-start gap-3">
+              <FileWarning className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold text-sm">Failed to parse packet capture</p>
+                <p className="mt-0.5">{errorMessage}</p>
+                <p className="mt-1 text-slate-400">
+                  Ensure the file is a valid PCAP/PCAPNG capture. Alternatively, test the application with one of our pre-built forensic scenarios below.
+                </p>
+              </div>
             </div>
+            <button
+              onClick={() => handleSelectSample('credential_leak_audit')}
+              className="px-3 py-1.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 rounded-lg text-xs font-semibold shrink-0 transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>Load Test Sample</span>
+            </button>
           </div>
         )}
 
@@ -199,6 +214,101 @@ export function App() {
                 Decoding Ethernet/IP/TCP frames, extracting unencrypted credentials, and running anomaly heuristics...
               </p>
             </div>
+          </div>
+        )}
+
+        {/* Initial Screen: File Upload + Forensic Scenario Chooser */}
+        {!isLoading && !analysisResult && (
+          <div className="py-8 space-y-10 max-w-5xl mx-auto animate-in fade-in duration-200">
+            
+            {/* Hero / Upload Box */}
+            <div className="text-center space-y-3">
+              <h2 className="text-2xl sm:text-3xl font-bold text-white tracking-tight font-sans">
+                PCAP Cleartext &amp; Forensic Analyzer
+              </h2>
+              <p className="text-sm text-slate-400 max-w-2xl mx-auto leading-relaxed">
+                Scan network packet captures for unencrypted passwords, HTTP Basic Auth, API tokens, sensitive PII, and security anomalies.
+              </p>
+            </div>
+
+            {/* Drag & Drop Upload Zone */}
+            <div 
+              onClick={() => landingFileInputRef.current?.click()}
+              className="group border-2 border-dashed border-slate-700 hover:border-cyan-500/80 bg-slate-900/60 hover:bg-slate-900/90 rounded-2xl p-8 text-center transition-all cursor-pointer shadow-xl shadow-slate-950/50 flex flex-col items-center justify-center gap-3"
+            >
+              <input
+                type="file"
+                ref={landingFileInputRef}
+                onChange={(e) => {
+                  if (e.target.files && e.target.files[0]) {
+                    handleFileUpload(e.target.files[0]);
+                  }
+                }}
+                accept=".pcap,.pcapng,.cap"
+                className="hidden"
+              />
+              <div className="w-14 h-14 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 group-hover:border-cyan-500/60 flex items-center justify-center text-cyan-400 group-hover:scale-105 transition-transform shadow-lg shadow-cyan-500/10">
+                <Upload className="w-7 h-7" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-white group-hover:text-cyan-300 transition-colors">
+                  Drop your PCAP file here, or <span className="text-cyan-400 underline underline-offset-2">browse files</span>
+                </p>
+                <p className="text-xs text-slate-400 font-mono">
+                  Supports Libpcap (.pcap), Wireshark NextGen (.pcapng), and TCPDump (.cap)
+                </p>
+              </div>
+            </div>
+
+            {/* Divider */}
+            <div className="relative flex items-center justify-center">
+              <div className="border-t border-slate-800 w-full" />
+              <span className="bg-slate-950 px-4 text-xs uppercase font-mono tracking-widest text-slate-400 shrink-0">
+                Or click a pre-loaded sample to test
+              </span>
+              <div className="border-t border-slate-800 w-full" />
+            </div>
+
+            {/* Scenario Cards Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {SAMPLE_PCAPS.map((sample) => (
+                <div 
+                  key={sample.id}
+                  className="bg-slate-900 border border-slate-800 hover:border-cyan-500/50 hover:shadow-lg hover:shadow-cyan-950/20 rounded-xl p-5 space-y-4 transition-all flex flex-col justify-between"
+                >
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <h3 className="font-bold text-sm text-white flex items-center gap-2">
+                        <span>{sample.name}</span>
+                      </h3>
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-cyan-300 border border-slate-700 font-mono shrink-0">
+                        {sample.badge}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 leading-relaxed">
+                      {sample.description}
+                    </p>
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {sample.highlights.map((h, i) => (
+                        <span key={i} className="text-[10px] px-2 py-0.5 rounded bg-slate-950 text-slate-400 border border-slate-800 font-mono">
+                          {h}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    id={`btn-landing-sample-${sample.id}`}
+                    onClick={() => handleSelectSample(sample.id)}
+                    className="w-full mt-2 px-3.5 py-2.5 bg-cyan-600/90 hover:bg-cyan-500 text-white rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md shadow-cyan-900/30"
+                  >
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>Load &amp; Inspect Sample</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+
           </div>
         )}
 

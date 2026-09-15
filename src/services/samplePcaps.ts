@@ -82,8 +82,8 @@ export class PcapBuilder {
     const view = new DataView(buffer);
     const uint8 = new Uint8Array(buffer);
 
-    // Global Header (Little Endian standard pcap: 0xd4c3b2a1)
-    view.setUint32(0, 0xd4c3b2a1, true); // Magic
+    // Global Header (Little Endian standard pcap: 0xa1b2c3d4 written little-endian produces d4 c3 b2 a1)
+    view.setUint32(0, 0xa1b2c3d4, true); // Magic
     view.setUint16(4, 2, true);          // Version major
     view.setUint16(6, 4, true);          // Version minor
     view.setInt32(8, 0, true);           // Thiszone
