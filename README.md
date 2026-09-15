@@ -1,7 +1,7 @@
 # PacketLens 🔍
 
 **PCAP Analyzer & Cleartext Inspector**
-*Developed by Frontline Tech Solutions (@ryguitarguy)*
+*Developed by Me (@ryguitarguy)*
 
 🌐 **Live Web App:** [packetlens.ai.studio](https://packetlens.ai.studio)
 
