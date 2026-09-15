@@ -1,0 +1,7 @@
+{
+  "name": "PCAP Analyzer & Cleartext Inspector",
+  "description": "Scan PCAP packet captures, extract unencrypted credentials and data, visualize traffic patterns, and detect network security anomalies.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
