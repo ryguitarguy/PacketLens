@@ -79,8 +79,31 @@ ${Object.entries(data.stats.protocolCounts).map(([p, count]) => `| ${p} | ${coun
 `;
   };
 
-  const markdownContent = generateMarkdown();
-  const jsonContent = JSON.stringify(data, null, 2);
+  const markdownContent = React.useMemo(() => generateMarkdown(), [data]);
+  const jsonContent = React.useMemo(() => {
+    const exportPayload = {
+      auditTimestamp: new Date().toISOString(),
+      filename: data.filename,
+      fileSizeBytes: data.fileSize,
+      totalPacketsAnalyzed: data.stats.totalPackets,
+      truncated: data.truncated,
+      totalPacketsInCapture: data.totalPacketsInCapture,
+      stats: data.stats,
+      cleartextFindings: data.cleartextItems,
+      securityAnomalies: data.anomalies,
+      sampleFirstPackets: data.parsedPackets.slice(0, 100).map(p => ({
+        id: p.id,
+        timestamp: p.timestamp,
+        relativeTime: p.relativeTime,
+        protocol: p.protocol,
+        source: `${p.sourceIp}${p.sourcePort ? `:${p.sourcePort}` : ''}`,
+        destination: `${p.destIp}${p.destPort ? `:${p.destPort}` : ''}`,
+        info: p.info,
+        length: p.originalLength || p.captureLength,
+      })),
+    };
+    return JSON.stringify(exportPayload, null, 2);
+  }, [data]);
   const activeContent = reportFormat === 'markdown' ? markdownContent : jsonContent;
 
   const handleCopy = () => {

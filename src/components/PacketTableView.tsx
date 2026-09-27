@@ -4,6 +4,9 @@ import {
   Filter, 
   ChevronRight, 
   ChevronDown, 
+  ChevronLeft,
+  ChevronsLeft,
+  ChevronsRight,
   Layers, 
   Binary, 
   LockOpen, 
@@ -28,25 +31,36 @@ export const PacketTableView: React.FC<PacketTableViewProps> = ({
   const [protocolFilter, setProtocolFilter] = useState<string>('all');
   const [cleartextOnly, setCleartextOnly] = useState<boolean>(false);
   const [expandedSection, setExpandedSection] = useState<'l2' | 'l3' | 'l4' | 'l7' | 'hex' | null>('l7');
+  
+  // High-performance pagination state
+  const [pageSize, setPageSize] = useState<number>(50);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [jumpPacketInput, setJumpPacketInput] = useState<string>('');
+
+  // Defer filter query to keep typing latency at 0ms even with 250k+ packets
+  const deferredFilterQuery = React.useDeferredValue(filterQuery);
 
   const selectedPacket = useMemo(() => {
-    return packets.find(p => p.id === selectedPacketId) || packets[0] || null;
+    if (selectedPacketId !== undefined && selectedPacketId >= 1 && selectedPacketId <= packets.length) {
+      const candidate = packets[selectedPacketId - 1];
+      if (candidate && candidate.id === selectedPacketId) return candidate;
+    }
+    return (selectedPacketId !== undefined ? packets.find(p => p.id === selectedPacketId) : null) || packets[0] || null;
   }, [packets, selectedPacketId]);
 
-  // Sync selected packet when prop changes
-  useEffect(() => {
-    if (selectedPacketId) {
-      setExpandedSection('l7');
-    }
-  }, [selectedPacketId]);
-
-  // Filtered packets
+  // Filtered packets with fast-path for non-filtered states
   const filteredPackets = useMemo(() => {
+    const trimmedQuery = deferredFilterQuery.trim();
+    if (!cleartextOnly && protocolFilter === 'all' && !trimmedQuery) {
+      return packets;
+    }
+
+    const q = trimmedQuery ? trimmedQuery.toLowerCase() : '';
+
     return packets.filter(p => {
       if (cleartextOnly && !p.isCleartext) return false;
       if (protocolFilter !== 'all' && p.protocol !== protocolFilter) return false;
-      if (filterQuery.trim()) {
-        const q = filterQuery.toLowerCase();
+      if (q) {
         const matchesIp = p.sourceIp.includes(q) || p.destIp.includes(q);
         const matchesPort = String(p.sourcePort || '').includes(q) || String(p.destPort || '').includes(q);
         const matchesProto = p.protocol.toLowerCase().includes(q);
@@ -58,7 +72,45 @@ export const PacketTableView: React.FC<PacketTableViewProps> = ({
       }
       return true;
     });
-  }, [packets, filterQuery, protocolFilter, cleartextOnly]);
+  }, [packets, deferredFilterQuery, protocolFilter, cleartextOnly]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredPackets.length / pageSize));
+
+  // Reset to page 1 on filter or page size changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterQuery, protocolFilter, cleartextOnly, pageSize]);
+
+  // Sync selected packet and ensure the containing page is visible
+  useEffect(() => {
+    if (selectedPacketId !== undefined) {
+      setExpandedSection('l7');
+      const idx = filteredPackets.findIndex(p => p.id === selectedPacketId);
+      if (idx !== -1) {
+        const targetPage = Math.floor(idx / pageSize) + 1;
+        setCurrentPage(targetPage);
+      }
+    }
+  }, [selectedPacketId, filteredPackets, pageSize]);
+
+  // Sliced packets for the current page
+  const paginatedPackets = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filteredPackets.slice(start, start + pageSize);
+  }, [filteredPackets, currentPage, pageSize]);
+
+  const handleJumpToPacket = (e: React.FormEvent) => {
+    e.preventDefault();
+    const id = parseInt(jumpPacketInput.trim(), 10);
+    if (!isNaN(id)) {
+      const idx = filteredPackets.findIndex(p => p.id === id);
+      if (idx !== -1) {
+        const targetPage = Math.floor(idx / pageSize) + 1;
+        setCurrentPage(targetPage);
+        onSelectPacket(id);
+      }
+    }
+  };
 
   // Protocol badge color
   const getProtocolBadge = (proto: string) => {
@@ -185,7 +237,7 @@ export const PacketTableView: React.FC<PacketTableViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/40 font-mono">
-                {filteredPackets.map(pkt => {
+                {paginatedPackets.map(pkt => {
                   const isSelected = selectedPacket?.id === pkt.id;
 
                   return (
@@ -231,9 +283,97 @@ export const PacketTableView: React.FC<PacketTableViewProps> = ({
             </table>
           </div>
 
-          <div className="bg-slate-950 px-3 py-2 border-t border-slate-800 text-[11px] text-slate-500 font-mono flex justify-between">
-            <span>Showing {filteredPackets.length} of {packets.length} packets</span>
-            <span>Click any packet to inspect headers and raw payload</span>
+          {/* Pagination Toolbar */}
+          <div className="bg-slate-950 px-3 py-2.5 border-t border-slate-800 text-[11px] text-slate-400 font-mono flex flex-col sm:flex-row items-center justify-between gap-3 select-none">
+            <div className="flex items-center gap-3">
+              <span>
+                Packets <strong className="text-white font-semibold">{filteredPackets.length > 0 ? (currentPage - 1) * pageSize + 1 : 0}</strong> – <strong className="text-white font-semibold">{Math.min(currentPage * pageSize, filteredPackets.length)}</strong> of <strong className="text-cyan-400 font-semibold">{filteredPackets.length.toLocaleString()}</strong>
+                {filteredPackets.length !== packets.length && (
+                  <span className="text-slate-500 ml-1">({packets.length.toLocaleString()} total)</span>
+                )}
+              </span>
+
+              {/* Page size dropdown */}
+              <div className="flex items-center gap-1.5 pl-2 border-l border-slate-800">
+                <span className="text-slate-500">Show:</span>
+                <select
+                  value={pageSize}
+                  onChange={e => setPageSize(Number(e.target.value))}
+                  className="bg-slate-900 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] text-slate-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={250}>250</option>
+                  <option value={500}>500</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Jump to packet # */}
+            <form onSubmit={handleJumpToPacket} className="flex items-center gap-1.5">
+              <span className="text-slate-500 hidden md:inline">Go to packet:</span>
+              <input
+                type="number"
+                min="1"
+                max={packets.length}
+                placeholder="No."
+                value={jumpPacketInput}
+                onChange={e => setJumpPacketInput(e.target.value)}
+                className="w-16 bg-slate-900 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] text-white focus:outline-none focus:border-indigo-500 text-center"
+              />
+              <button
+                type="submit"
+                className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] border border-slate-700 transition-colors"
+              >
+                Go
+              </button>
+            </form>
+
+            {/* Page navigation buttons */}
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setCurrentPage(1)}
+                disabled={currentPage <= 1}
+                className="p-1 rounded hover:bg-slate-800 text-slate-400 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                title="First Page"
+              >
+                <ChevronsLeft className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                disabled={currentPage <= 1}
+                className="p-1 rounded hover:bg-slate-800 text-slate-400 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                title="Previous Page"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+
+              <span className="px-2 py-0.5 text-slate-300">
+                Page <strong className="text-white">{currentPage}</strong> of <strong className="text-white">{totalPages}</strong>
+              </span>
+
+              <button
+                type="button"
+                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                disabled={currentPage >= totalPages}
+                className="p-1 rounded hover:bg-slate-800 text-slate-400 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                title="Next Page"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setCurrentPage(totalPages)}
+                disabled={currentPage >= totalPages}
+                className="p-1 rounded hover:bg-slate-800 text-slate-400 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                title="Last Page"
+              >
+                <ChevronsRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
 

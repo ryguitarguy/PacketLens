@@ -2,6 +2,24 @@ import { Packet, SecurityAnomaly, CleartextItem } from '../types';
 
 export class AnomalyDetector {
   public static detect(packets: Packet[], cleartextItems: CleartextItem[]): SecurityAnomaly[] {
+    return this.detectInternal(packets, cleartextItems);
+  }
+
+  public static async detectAsync(
+    packets: Packet[],
+    cleartextItems: CleartextItem[],
+    onProgress?: (p: { percent: number }) => void,
+    shouldAbort?: () => boolean
+  ): Promise<SecurityAnomaly[]> {
+    return this.detectInternalAsync(packets, cleartextItems, onProgress, shouldAbort);
+  }
+
+  private static async detectInternalAsync(
+    packets: Packet[],
+    cleartextItems: CleartextItem[],
+    onProgress?: (p: { percent: number }) => void,
+    shouldAbort?: () => boolean
+  ): Promise<SecurityAnomaly[]> {
     const anomalies: SecurityAnomaly[] = [];
     let anomalyIdCounter = 1;
 
@@ -16,7 +34,7 @@ export class AnomalyDetector {
     const credItems = cleartextItems.filter(i => i.category === 'Credentials & Passwords' || i.category === 'Session & Auth Tokens');
     if (credItems.length > 0) {
       const topOffenders = Array.from(new Set(credItems.map(c => `${c.sourceIp} → ${c.destIp} (${c.protocol})`))).slice(0, 3);
-      const packetIds = Array.from(new Set(credItems.map(c => c.packetId)));
+      const packetIds = Array.from(new Set(credItems.map(c => c.packetId))).slice(0, 50);
       
       addAnomaly({
         title: 'Plaintext Authentication Credentials & Tokens Transmitted',
@@ -32,34 +50,123 @@ export class AnomalyDetector {
         evidence: {
           totalCleartextSecrets: credItems.length,
           observedStreams: topOffenders,
-          sampleTypes: Array.from(new Set(credItems.map(c => c.label))),
+          sampleTypes: Array.from(new Set(credItems.map(c => c.label))).slice(0, 10),
         },
       });
     }
 
-    // 2. Port Scanning / Network Service Discovery (Horizontal or Vertical Reconnaissance)
+    // 2-6. Single-pass over packets to avoid multiple heavy filter passes and keep memory light
     const synScanTracker: Map<string, { targetIp: string; ports: Set<number>; packetIds: number[]; synOnlyCount: number }> = new Map();
+    const suspiciousDnsQueries: { packetId: number; name: string; entropy: number; len: number; srcIp: string; dstIp: string }[] = [];
+    const entropyCache = new Map<string, number>();
 
-    for (const packet of packets) {
+    let telnetCount = 0;
+    const telnetIds: number[] = [];
+    let telnetSrc = '';
+    let telnetDst = '';
+
+    let ftpCount = 0;
+    const ftpIds: number[] = [];
+    let ftpSrc = '';
+    let ftpDst = '';
+
+    const suspiciousPorts = [4444, 1337, 6667, 31337, 8888, 9999];
+    const suspiciousPortPackets: { port: number; packet: Packet }[] = [];
+
+    const totalCount = packets.length;
+    let lastYieldTime = performance.now();
+
+    for (let i = 0; i < totalCount; i++) {
+      if (shouldAbort && shouldAbort()) {
+        throw new Error('Analysis cancelled by user');
+      }
+
+      const now = performance.now();
+      if (now - lastYieldTime > 20 || i % 5000 === 0) {
+        onProgress?.({ percent: Math.round((i / totalCount) * 100) });
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        lastYieldTime = performance.now();
+      }
+
+      const packet = packets[i];
+
+      // A. TCP SYN scan detection
       if (packet.protocol === 'TCP' && packet.tcpFlags?.syn && !packet.tcpFlags?.ack) {
         const key = `${packet.sourceIp}->${packet.destIp}`;
-        if (!synScanTracker.has(key)) {
-          synScanTracker.set(key, { targetIp: packet.destIp, ports: new Set(), packetIds: [], synOnlyCount: 0 });
+        let tracker = synScanTracker.get(key);
+        if (!tracker && synScanTracker.size < 1000) {
+          tracker = { targetIp: packet.destIp, ports: new Set(), packetIds: [], synOnlyCount: 0 };
+          synScanTracker.set(key, tracker);
         }
-        const tracker = synScanTracker.get(key)!;
-        if (packet.destPort) tracker.ports.add(packet.destPort);
-        tracker.packetIds.push(packet.id);
-        tracker.synOnlyCount++;
+        if (tracker) {
+          if (packet.destPort && tracker.ports.size < 100) tracker.ports.add(packet.destPort);
+          if (tracker.packetIds.length < 50) tracker.packetIds.push(packet.id);
+          tracker.synOnlyCount++;
+        }
+      }
+
+      // B. Telnet detection
+      if (packet.protocol === 'TELNET') {
+        telnetCount++;
+        if (telnetIds.length < 50) telnetIds.push(packet.id);
+        if (!telnetSrc) {
+          telnetSrc = packet.sourceIp;
+          telnetDst = packet.destIp;
+        }
+      }
+
+      // C. FTP detection
+      if (packet.protocol === 'FTP') {
+        ftpCount++;
+        if (ftpIds.length < 50) ftpIds.push(packet.id);
+        if (!ftpSrc) {
+          ftpSrc = packet.sourceIp;
+          ftpDst = packet.destIp;
+        }
+      }
+
+      // D. Suspicious non-standard ports
+      const pPort = packet.destPort || packet.sourcePort || 0;
+      if (suspiciousPorts.includes(pPort) && suspiciousPortPackets.length < 10) {
+        suspiciousPortPackets.push({ port: pPort, packet });
+      }
+
+      // E. DNS Tunneling & High-Entropy
+      if (packet.protocol === 'DNS' && packet.dnsDetails?.isQuery && packet.dnsDetails.queries) {
+        for (const q of packet.dnsDetails.queries) {
+          const parts = q.name.split('.');
+          const subdomain = parts[0] || '';
+          let entropy = entropyCache.get(subdomain);
+          if (entropy === undefined) {
+            entropy = this.calculateShannonEntropy(subdomain);
+            if (entropyCache.size < 500) entropyCache.set(subdomain, entropy);
+          }
+
+          if ((subdomain.length >= 25 && entropy >= 3.4) || (q.name.length >= 45 && entropy >= 3.6)) {
+            if (suspiciousDnsQueries.length < 50) {
+              suspiciousDnsQueries.push({
+                packetId: packet.id,
+                name: q.name,
+                entropy: Number(entropy.toFixed(2)),
+                len: q.name.length,
+                srcIp: packet.sourceIp,
+                dstIp: packet.destIp,
+              });
+            }
+          }
+        }
       }
     }
 
+    onProgress?.({ percent: 100 });
+
+    // Port scan anomalies
     for (const [key, data] of synScanTracker.entries()) {
       const [srcIp, dstIp] = key.split('->');
-      // If 4 or more distinct ports were targeted by SYN probes, or more than 8 rapid SYN packets to a host
       if (data.ports.size >= 4 || data.synOnlyCount >= 8) {
         const portList = Array.from(data.ports).sort((a, b) => a - b);
         addAnomaly({
-          title: `Port Scan / Reconnaissance Probe (${portList.length} Ports Targeted)`,
+          title: `Port Scan / Reconnaissance Probe (${data.ports.size} Ports Targeted)`,
           severity: data.ports.size > 8 ? 'critical' : 'high',
           category: 'Port Scan / Reconnaissance',
           protocol: 'TCP',
@@ -68,7 +175,7 @@ export class AnomalyDetector {
           description: `Host ${srcIp} performed rapid TCP SYN port probing against target ${dstIp}, attempting connection handshakes across ${data.ports.size} distinct ports. This activity matches signature network mapping tools (e.g. Nmap / Masscan) searching for open services.`,
           mitreId: 'T1046',
           mitreTitle: 'Network Service Discovery',
-          packetIds: data.packetIds.slice(0, 50),
+          packetIds: data.packetIds,
           evidence: {
             probedPortsCount: data.ports.size,
             sampleProbedPorts: portList.slice(0, 15).join(', ') + (portList.length > 15 ? '...' : ''),
@@ -78,39 +185,16 @@ export class AnomalyDetector {
       }
     }
 
-    // 3. DNS Tunneling & High-Entropy Data Exfiltration
-    const dnsPackets = packets.filter(p => p.protocol === 'DNS' && p.dnsDetails?.isQuery);
-    const suspiciousDnsQueries: { packetId: number; name: string; entropy: number; len: number }[] = [];
-
-    for (const p of dnsPackets) {
-      if (p.dnsDetails?.queries) {
-        for (const q of p.dnsDetails.queries) {
-          const parts = q.name.split('.');
-          const subdomain = parts[0] || '';
-          const entropy = this.calculateShannonEntropy(subdomain);
-          // If subdomain is long (>25 chars) and high entropy (>3.5), or query name exceeds 45 chars
-          if ((subdomain.length >= 25 && entropy >= 3.4) || (q.name.length >= 45 && entropy >= 3.6)) {
-            suspiciousDnsQueries.push({
-              packetId: p.id,
-              name: q.name,
-              entropy: Number(entropy.toFixed(2)),
-              len: q.name.length,
-            });
-          }
-        }
-      }
-    }
-
+    // DNS Tunneling Anomaly
     if (suspiciousDnsQueries.length >= 2) {
       const firstSus = suspiciousDnsQueries[0];
-      const packet = packets.find(p => p.id === firstSus.packetId);
       addAnomaly({
         title: 'DNS Tunneling / Data Exfiltration Anomaly',
         severity: 'critical',
         category: 'DNS Tunneling / Exfiltration',
         protocol: 'DNS',
-        sourceIp: packet?.sourceIp || 'Unknown',
-        destinationIp: packet?.destIp || 'Unknown',
+        sourceIp: firstSus.srcIp,
+        destinationIp: firstSus.dstIp,
         description: `Identified ${suspiciousDnsQueries.length} DNS query requests with abnormally high Shannon entropy and unusually long subdomain strings. This traffic pattern strongly suggests DNS covert channel communication or data exfiltration over UDP port 53.`,
         mitreId: 'T1048.003',
         mitreTitle: 'Exfiltration Over Alternative Protocol: DNS Exfiltration',
@@ -124,66 +208,53 @@ export class AnomalyDetector {
       });
     }
 
-    // 4. Insecure Legacy Protocol: Telnet
-    const telnetPackets = packets.filter(p => p.protocol === 'TELNET');
-    if (telnetPackets.length > 0) {
-      const src = telnetPackets[0].sourceIp;
-      const dst = telnetPackets[0].destIp;
+    // Telnet Anomaly
+    if (telnetCount > 0) {
       addAnomaly({
         title: 'Cleartext Management Protocol In Use: Telnet (Port 23)',
         severity: 'high',
         category: 'Insecure Legacy Protocol',
         protocol: 'TELNET',
-        sourceIp: src,
+        sourceIp: telnetSrc,
         sourcePort: 23,
-        destinationIp: dst,
-        description: `Host ${src} is using unencrypted Telnet protocol for remote shell administration. Telnet sends all keystrokes, administrative credentials, and server responses in plaintext without integrity protection.`,
+        destinationIp: telnetDst,
+        description: `Host ${telnetSrc} is using unencrypted Telnet protocol for remote shell administration. Telnet sends all keystrokes, administrative credentials, and server responses in plaintext without integrity protection.`,
         mitreId: 'T1040',
         mitreTitle: 'Network Sniffing / Insecure Remote Services',
-        packetIds: telnetPackets.map(p => p.id),
+        packetIds: telnetIds,
         evidence: {
-          packetCount: telnetPackets.length,
+          packetCount: telnetCount,
           port: 23,
           recommendation: 'Decommission Telnet immediately and enforce SSH (Port 22) with key-based authentication.',
         },
       });
     }
 
-    // 5. Insecure Legacy Protocol: Unencrypted FTP
-    const ftpPackets = packets.filter(p => p.protocol === 'FTP');
-    if (ftpPackets.length > 0) {
-      const src = ftpPackets[0].sourceIp;
-      const dst = ftpPackets[0].destIp;
+    // FTP Anomaly
+    if (ftpCount > 0) {
       addAnomaly({
         title: 'Cleartext File Transfer Protocol In Use: FTP (Port 21)',
         severity: 'medium',
         category: 'Insecure Legacy Protocol',
         protocol: 'FTP',
-        sourceIp: src,
+        sourceIp: ftpSrc,
         sourcePort: 21,
-        destinationIp: dst,
-        description: `Unencrypted FTP (File Transfer Protocol) detected between ${src} and ${dst}. File contents, directory structures, and authentication credentials traverse the wire in cleartext.`,
+        destinationIp: ftpDst,
+        description: `Unencrypted FTP (File Transfer Protocol) detected between ${ftpSrc} and ${ftpDst}. File contents, directory structures, and authentication credentials traverse the wire in cleartext.`,
         mitreId: 'T1040',
         mitreTitle: 'Network Sniffing',
-        packetIds: ftpPackets.map(p => p.id),
+        packetIds: ftpIds,
         evidence: {
-          packetCount: ftpPackets.length,
+          packetCount: ftpCount,
           port: 21,
           recommendation: 'Migrate file transfer workflows to SFTP (SSH File Transfer) or FTPS (TLS).',
         },
       });
     }
 
-    // 6. Suspicious Non-Standard Shell / Trojan Ports
-    const suspiciousPorts = [4444, 1337, 6667, 31337, 8888, 9999];
-    const suspiciousPortPackets = packets.filter(p => 
-      (p.destPort && suspiciousPorts.includes(p.destPort)) || 
-      (p.sourcePort && suspiciousPorts.includes(p.sourcePort))
-    );
-
+    // Suspicious Ports Anomaly
     if (suspiciousPortPackets.length > 0) {
-      const p = suspiciousPortPackets[0];
-      const flaggedPort = suspiciousPorts.find(port => port === p.destPort || port === p.sourcePort) || 0;
+      const { port: flaggedPort, packet: p } = suspiciousPortPackets[0];
       addAnomaly({
         title: `Suspicious Non-Standard Port Traffic (Port ${flaggedPort})`,
         severity: 'high',
@@ -196,36 +267,11 @@ export class AnomalyDetector {
         description: `Observed active communication over port ${flaggedPort}, which is commonly associated with reverse shell payloads, IRC botnet command-and-control, or unauthorized backdoor utilities.`,
         mitreId: 'T1571',
         mitreTitle: 'Non-Standard Port',
-        packetIds: suspiciousPortPackets.map(pkt => pkt.id),
+        packetIds: suspiciousPortPackets.map(item => item.packet.id),
         evidence: {
-          observedPort: flaggedPort,
-          packetCount: suspiciousPortPackets.length,
-        },
-      });
-    }
-
-    // 7. Internal Network Name Leakage over Plaintext DNS
-    const internalDns = dnsPackets.filter(p => 
-      p.dnsDetails?.queries.some(q => /\.local$|\.corp$|\.internal$|\.lan$/i.test(q.name))
-    );
-    if (internalDns.length > 0) {
-      const leakedNames = Array.from(new Set(
-        internalDns.flatMap(p => p.dnsDetails?.queries.map(q => q.name) || [])
-      ));
-      addAnomaly({
-        title: 'Internal Corporate Hostname Leakage over DNS',
-        severity: 'low',
-        category: 'Cleartext Transmission',
-        protocol: 'DNS',
-        sourceIp: internalDns[0].sourceIp,
-        destinationIp: internalDns[0].destIp,
-        description: `Unencrypted DNS queries reveal internal corporate infrastructure names (${leakedNames.slice(0, 3).join(', ')}). This leaks internal network topologies, domain controllers, and asset naming conventions to external eavesdroppers.`,
-        mitreId: 'T1590',
-        mitreTitle: 'Gather Victim Network Information',
-        packetIds: internalDns.map(p => p.id),
-        evidence: {
-          leakedDomains: leakedNames,
-          queryCount: internalDns.length,
+          flaggedPort,
+          protocol: p.protocol,
+          recommendation: 'Isolate host endpoint and inspect active processes listening on this port.',
         },
       });
     }
@@ -233,19 +279,250 @@ export class AnomalyDetector {
     return anomalies;
   }
 
-  // Shannon Entropy formula: H(X) = -sum(P(x) * log2(P(x)))
+  private static detectInternal(packets: Packet[], cleartextItems: CleartextItem[]): SecurityAnomaly[] {
+    const anomalies: SecurityAnomaly[] = [];
+    let anomalyIdCounter = 1;
+
+    const addAnomaly = (anomaly: Omit<SecurityAnomaly, 'id'>) => {
+      anomalies.push({
+        id: `anomaly-${anomalyIdCounter++}`,
+        ...anomaly,
+      });
+    };
+
+    const credItems = cleartextItems.filter(i => i.category === 'Credentials & Passwords' || i.category === 'Session & Auth Tokens');
+    if (credItems.length > 0) {
+      const topOffenders = Array.from(new Set(credItems.map(c => `${c.sourceIp} → ${c.destIp} (${c.protocol})`))).slice(0, 3);
+      const packetIds = Array.from(new Set(credItems.map(c => c.packetId))).slice(0, 50);
+      
+      addAnomaly({
+        title: 'Plaintext Authentication Credentials & Tokens Transmitted',
+        severity: 'critical',
+        category: 'Cleartext Transmission',
+        protocol: credItems[0].protocol,
+        sourceIp: credItems[0].sourceIp,
+        destinationIp: credItems[0].destIp,
+        description: `Detected ${credItems.length} instance(s) of unencrypted passwords, HTTP Basic Auth credentials, or bearer tokens transmitted across the wire without TLS encryption. Any network eavesdropper or intermediate proxy can harvest these secrets in real-time.`,
+        mitreId: 'T1552.001',
+        mitreTitle: 'Credentials in Files or Unencrypted Protocols',
+        packetIds,
+        evidence: {
+          totalCleartextSecrets: credItems.length,
+          observedStreams: topOffenders,
+          sampleTypes: Array.from(new Set(credItems.map(c => c.label))).slice(0, 10),
+        },
+      });
+    }
+
+    const synScanTracker: Map<string, { targetIp: string; ports: Set<number>; packetIds: number[]; synOnlyCount: number }> = new Map();
+    const suspiciousDnsQueries: { packetId: number; name: string; entropy: number; len: number; srcIp: string; dstIp: string }[] = [];
+    const entropyCache = new Map<string, number>();
+
+    let telnetCount = 0;
+    const telnetIds: number[] = [];
+    let telnetSrc = '';
+    let telnetDst = '';
+
+    let ftpCount = 0;
+    const ftpIds: number[] = [];
+    let ftpSrc = '';
+    let ftpDst = '';
+
+    const suspiciousPorts = [4444, 1337, 6667, 31337, 8888, 9999];
+    const suspiciousPortPackets: { port: number; packet: Packet }[] = [];
+
+    for (let i = 0; i < packets.length; i++) {
+      const packet = packets[i];
+
+      if (packet.protocol === 'TCP' && packet.tcpFlags?.syn && !packet.tcpFlags?.ack) {
+        const key = `${packet.sourceIp}->${packet.destIp}`;
+        let tracker = synScanTracker.get(key);
+        if (!tracker && synScanTracker.size < 1000) {
+          tracker = { targetIp: packet.destIp, ports: new Set(), packetIds: [], synOnlyCount: 0 };
+          synScanTracker.set(key, tracker);
+        }
+        if (tracker) {
+          if (packet.destPort && tracker.ports.size < 100) tracker.ports.add(packet.destPort);
+          if (tracker.packetIds.length < 50) tracker.packetIds.push(packet.id);
+          tracker.synOnlyCount++;
+        }
+      }
+
+      if (packet.protocol === 'TELNET') {
+        telnetCount++;
+        if (telnetIds.length < 50) telnetIds.push(packet.id);
+        if (!telnetSrc) {
+          telnetSrc = packet.sourceIp;
+          telnetDst = packet.destIp;
+        }
+      }
+
+      if (packet.protocol === 'FTP') {
+        ftpCount++;
+        if (ftpIds.length < 50) ftpIds.push(packet.id);
+        if (!ftpSrc) {
+          ftpSrc = packet.sourceIp;
+          ftpDst = packet.destIp;
+        }
+      }
+
+      const pPort = packet.destPort || packet.sourcePort || 0;
+      if (suspiciousPorts.includes(pPort) && suspiciousPortPackets.length < 10) {
+        suspiciousPortPackets.push({ port: pPort, packet });
+      }
+
+      if (packet.protocol === 'DNS' && packet.dnsDetails?.isQuery && packet.dnsDetails.queries) {
+        for (const q of packet.dnsDetails.queries) {
+          const parts = q.name.split('.');
+          const subdomain = parts[0] || '';
+          let entropy = entropyCache.get(subdomain);
+          if (entropy === undefined) {
+            entropy = this.calculateShannonEntropy(subdomain);
+            if (entropyCache.size < 500) entropyCache.set(subdomain, entropy);
+          }
+
+          if ((subdomain.length >= 25 && entropy >= 3.4) || (q.name.length >= 45 && entropy >= 3.6)) {
+            if (suspiciousDnsQueries.length < 50) {
+              suspiciousDnsQueries.push({
+                packetId: packet.id,
+                name: q.name,
+                entropy: Number(entropy.toFixed(2)),
+                len: q.name.length,
+                srcIp: packet.sourceIp,
+                dstIp: packet.destIp,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    for (const [key, data] of synScanTracker.entries()) {
+      const [srcIp, dstIp] = key.split('->');
+      if (data.ports.size >= 4 || data.synOnlyCount >= 8) {
+        const portList = Array.from(data.ports).sort((a, b) => a - b);
+        addAnomaly({
+          title: `Port Scan / Reconnaissance Probe (${data.ports.size} Ports Targeted)`,
+          severity: data.ports.size > 8 ? 'critical' : 'high',
+          category: 'Port Scan / Reconnaissance',
+          protocol: 'TCP',
+          sourceIp: srcIp,
+          destinationIp: dstIp,
+          description: `Host ${srcIp} performed rapid TCP SYN port probing against target ${dstIp}, attempting connection handshakes across ${data.ports.size} distinct ports. This activity matches signature network mapping tools (e.g. Nmap / Masscan) searching for open services.`,
+          mitreId: 'T1046',
+          mitreTitle: 'Network Service Discovery',
+          packetIds: data.packetIds,
+          evidence: {
+            probedPortsCount: data.ports.size,
+            sampleProbedPorts: portList.slice(0, 15).join(', ') + (portList.length > 15 ? '...' : ''),
+            totalSynPackets: data.synOnlyCount,
+          },
+        });
+      }
+    }
+
+    if (suspiciousDnsQueries.length >= 2) {
+      const firstSus = suspiciousDnsQueries[0];
+      addAnomaly({
+        title: 'DNS Tunneling / Data Exfiltration Anomaly',
+        severity: 'critical',
+        category: 'DNS Tunneling / Exfiltration',
+        protocol: 'DNS',
+        sourceIp: firstSus.srcIp,
+        destinationIp: firstSus.dstIp,
+        description: `Identified ${suspiciousDnsQueries.length} DNS query requests with abnormally high Shannon entropy and unusually long subdomain strings. This traffic pattern strongly suggests DNS covert channel communication or data exfiltration over UDP port 53.`,
+        mitreId: 'T1048.003',
+        mitreTitle: 'Exfiltration Over Alternative Protocol: DNS Exfiltration',
+        packetIds: suspiciousDnsQueries.map(s => s.packetId),
+        evidence: {
+          suspiciousQueriesCount: suspiciousDnsQueries.length,
+          sampleDomain: firstSus.name,
+          shannonEntropy: firstSus.entropy,
+          subdomainLength: firstSus.len,
+        },
+      });
+    }
+
+    if (telnetCount > 0) {
+      addAnomaly({
+        title: 'Cleartext Management Protocol In Use: Telnet (Port 23)',
+        severity: 'high',
+        category: 'Insecure Legacy Protocol',
+        protocol: 'TELNET',
+        sourceIp: telnetSrc,
+        sourcePort: 23,
+        destinationIp: telnetDst,
+        description: `Host ${telnetSrc} is using unencrypted Telnet protocol for remote shell administration. Telnet sends all keystrokes, administrative credentials, and server responses in plaintext without integrity protection.`,
+        mitreId: 'T1040',
+        mitreTitle: 'Network Sniffing / Insecure Remote Services',
+        packetIds: telnetIds,
+        evidence: {
+          packetCount: telnetCount,
+          port: 23,
+          recommendation: 'Decommission Telnet immediately and enforce SSH (Port 22) with key-based authentication.',
+        },
+      });
+    }
+
+    if (ftpCount > 0) {
+      addAnomaly({
+        title: 'Cleartext File Transfer Protocol In Use: FTP (Port 21)',
+        severity: 'medium',
+        category: 'Insecure Legacy Protocol',
+        protocol: 'FTP',
+        sourceIp: ftpSrc,
+        sourcePort: 21,
+        destinationIp: ftpDst,
+        description: `Unencrypted FTP (File Transfer Protocol) detected between ${ftpSrc} and ${ftpDst}. File contents, directory structures, and authentication credentials traverse the wire in cleartext.`,
+        mitreId: 'T1040',
+        mitreTitle: 'Network Sniffing',
+        packetIds: ftpIds,
+        evidence: {
+          packetCount: ftpCount,
+          port: 21,
+          recommendation: 'Migrate file transfer workflows to SFTP (SSH File Transfer) or FTPS (TLS).',
+        },
+      });
+    }
+
+    if (suspiciousPortPackets.length > 0) {
+      const { port: flaggedPort, packet: p } = suspiciousPortPackets[0];
+      addAnomaly({
+        title: `Suspicious Non-Standard Port Traffic (Port ${flaggedPort})`,
+        severity: 'high',
+        category: 'Suspicious Traffic Spike',
+        protocol: p.protocol,
+        sourceIp: p.sourceIp,
+        sourcePort: p.sourcePort,
+        destinationIp: p.destIp,
+        destinationPort: p.destPort,
+        description: `Observed active communication over port ${flaggedPort}, which is commonly associated with reverse shell payloads, IRC botnet command-and-control, or unauthorized backdoor utilities.`,
+        mitreId: 'T1571',
+        mitreTitle: 'Non-Standard Port',
+        packetIds: suspiciousPortPackets.map(item => item.packet.id),
+        evidence: {
+          flaggedPort,
+          protocol: p.protocol,
+          recommendation: 'Isolate host endpoint and inspect active processes listening on this port.',
+        },
+      });
+    }
+
+    return anomalies;
+  }
+
   private static calculateShannonEntropy(str: string): number {
     if (!str || str.length === 0) return 0;
-    const len = str.length;
-    const frequencies: Record<string, number> = {};
-    for (let i = 0; i < len; i++) {
+    const freq: Record<string, number> = {};
+    for (let i = 0; i < str.length; i++) {
       const ch = str[i];
-      frequencies[ch] = (frequencies[ch] || 0) + 1;
+      freq[ch] = (freq[ch] || 0) + 1;
     }
 
     let entropy = 0;
-    for (const ch in frequencies) {
-      const p = frequencies[ch] / len;
+    const len = str.length;
+    for (const ch of Object.keys(freq)) {
+      const p = freq[ch] / len;
       entropy -= p * Math.log2(p);
     }
     return entropy;

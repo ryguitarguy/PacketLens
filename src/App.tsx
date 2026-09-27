@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { Navbar } from './components/Navbar';
 import { SummaryCards } from './components/SummaryCards';
 import { UnencryptedDataView } from './components/UnencryptedDataView';
@@ -11,7 +11,7 @@ import { UnencryptedScanner } from './services/unencryptedScanner';
 import { AnomalyDetector } from './services/anomalyDetector';
 import { StatsEngine } from './services/statsEngine';
 import { SAMPLE_PCAPS } from './services/samplePcaps';
-import { AnalysisResult } from './types';
+import { AnalysisResult, AnalysisProgress } from './types';
 import { 
   Upload, 
   ShieldAlert, 
@@ -20,8 +20,27 @@ import {
   HardDrive,
   FolderOpen,
   Play,
-  ArrowRight
+  ArrowRight,
+  AlertTriangle,
+  X,
+  Cpu,
+  Zap,
+  Sliders,
+  Gauge
 } from 'lucide-react';
+
+const formatFileSize = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+};
+
+const CAPACITY_OPTIONS = [
+  { value: 100000, label: '100,000 frames', desc: 'Fast / Standard' },
+  { value: 250000, label: '250,000 frames', desc: 'Deep Forensics (Default)' },
+  { value: 500000, label: '500,000 frames', desc: 'Ultra-High Capacity' },
+  { value: 1000000, label: '1,000,000 frames', desc: 'Maximum Stream Capacity' },
+];
 
 export function App() {
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
@@ -29,31 +48,111 @@ export function App() {
   const [activeTab, setActiveTab] = useState<'unencrypted' | 'anomalies' | 'traffic' | 'packets'>('unencrypted');
   const [selectedPacketId, setSelectedPacketId] = useState<number | undefined>(undefined);
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [loadingProgress, setLoadingProgress] = useState<AnalysisProgress | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
-  const landingFileInputRef = React.useRef<HTMLInputElement>(null);
+  const [packetCapacity, setPacketCapacity] = useState<number>(250000);
+  const landingFileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<{ aborted: boolean }>({ aborted: false });
 
-  // Process raw PCAP ArrayBuffer through parsing and analytics engines
-  const processPcapBuffer = useCallback((buffer: ArrayBuffer, filename: string) => {
+  // Process raw PCAP ArrayBuffer through parsing and analytics engines asynchronously
+  const processPcapBuffer = useCallback(async (buffer: ArrayBuffer, filename: string, capacityOverride?: number) => {
     setIsLoading(true);
     setErrorMessage(null);
+    abortRef.current = { aborted: false };
+    const limit = capacityOverride ?? packetCapacity;
 
     try {
-      // 1. Binary PCAP / PCAPNG parsing
-      const parseOutput = PcapParser.parse(buffer);
+      setLoadingProgress({
+        stage: 'parsing',
+        percent: 5,
+        message: `Initializing 0-copy frame parser (Capacity up to ${limit.toLocaleString()} frames)...`,
+        packetsCount: 0,
+      });
+
+      // 1. Binary PCAP / PCAPNG parsing with chunked yielding & zero-copy string interning
+      const parseOutput = await PcapParser.parseAsync(
+        buffer,
+        (p) => {
+          setLoadingProgress({
+            stage: 'parsing',
+            percent: Math.min(60, Math.round(p.percent * 0.6)),
+            message: `Parsing frames & headers (${p.parsedCount.toLocaleString()} indexed)...`,
+            packetsCount: p.parsedCount,
+          });
+        },
+        () => abortRef.current.aborted,
+        limit
+      );
+
       if (parseOutput.packets.length === 0) {
         throw new Error('No valid IP frames found in capture file.');
       }
 
-      // 2. Cleartext & credential harvesting
-      const cleartextItems = UnencryptedScanner.scan(parseOutput.packets);
+      // 2. Cleartext & credential harvesting with non-blocking stream analyzer
+      setLoadingProgress({
+        stage: 'scanning',
+        percent: 65,
+        message: `Scanning ${parseOutput.packets.length.toLocaleString()} packets for plaintext credentials & tokens...`,
+        packetsCount: parseOutput.packets.length,
+      });
 
-      // 3. Security anomaly detection
-      const anomalies = AnomalyDetector.detect(parseOutput.packets, cleartextItems);
+      const cleartextItems = await UnencryptedScanner.scanAsync(
+        parseOutput.packets,
+        (p) => {
+          setLoadingProgress({
+            stage: 'scanning',
+            percent: 65 + Math.round(p.percent * 0.15),
+            message: `Harvesting credentials & auth secrets (${p.percent}%)...`,
+            packetsCount: parseOutput.packets.length,
+          });
+        },
+        () => abortRef.current.aborted
+      );
 
-      // 4. Traffic statistics engine
-      const stats = StatsEngine.compute(parseOutput.packets);
+      // 3. Security anomaly detection (single-pass chunked engine)
+      setLoadingProgress({
+        stage: 'anomalies',
+        percent: 85,
+        message: 'Evaluating MITRE ATT&CK techniques & network anomalies...',
+        packetsCount: parseOutput.packets.length,
+      });
+
+      const anomalies = await AnomalyDetector.detectAsync(
+        parseOutput.packets,
+        cleartextItems,
+        (p) => {
+          setLoadingProgress({
+            stage: 'anomalies',
+            percent: 85 + Math.round(p.percent * 0.08),
+            message: `Evaluating MITRE ATT&CK techniques & anomalies (${p.percent}%)...`,
+            packetsCount: parseOutput.packets.length,
+          });
+        },
+        () => abortRef.current.aborted
+      );
+
+      // 4. Traffic statistics engine (single-pass chunked async aggregation)
+      setLoadingProgress({
+        stage: 'stats',
+        percent: 94,
+        message: 'Generating traffic rate timeline & conversation matrix...',
+        packetsCount: parseOutput.packets.length,
+      });
+
+      const stats = await StatsEngine.computeAsync(
+        parseOutput.packets,
+        (p) => {
+          setLoadingProgress({
+            stage: 'stats',
+            percent: 94 + Math.round(p.percent * 0.05),
+            message: `Aggregating traffic matrix & time buckets (${p.percent}%)...`,
+            packetsCount: parseOutput.packets.length,
+          });
+        },
+        () => abortRef.current.aborted
+      );
 
       setAnalysisResult({
         filename,
@@ -62,23 +161,33 @@ export function App() {
         cleartextItems,
         anomalies,
         stats,
+        truncated: parseOutput.truncated,
+        totalPacketsInCapture: parseOutput.totalCount,
       });
       setCurrentBuffer(buffer);
       setSelectedPacketId(parseOutput.packets[0]?.id);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to parse PCAP file';
-      setErrorMessage(msg);
+      if (abortRef.current.aborted) {
+        setErrorMessage(null);
+      } else {
+        const msg = err instanceof Error ? err.message : 'Failed to parse PCAP file';
+        setErrorMessage(msg);
+      }
     } finally {
       setIsLoading(false);
+      setLoadingProgress(null);
     }
-  }, []);
+  }, [packetCapacity]);
 
   // Clear current capture and return to scenario picker
   const handleClearCapture = () => {
+    abortRef.current = { aborted: true };
     setAnalysisResult(null);
     setCurrentBuffer(null);
     setSelectedPacketId(undefined);
     setErrorMessage(null);
+    setLoadingProgress(null);
+    setIsLoading(false);
   };
 
   // Load a chosen sample
@@ -90,6 +199,15 @@ export function App() {
 
   // Upload user file
   const handleFileUpload = (file: File) => {
+    setIsLoading(true);
+    setErrorMessage(null);
+    abortRef.current = { aborted: false };
+    setLoadingProgress({
+      stage: 'reading',
+      percent: 2,
+      message: `Reading ${file.name} (${formatFileSize(file.size)})...`,
+    });
+
     const reader = new FileReader();
     reader.onload = (e) => {
       if (e.target?.result instanceof ArrayBuffer) {
@@ -97,9 +215,19 @@ export function App() {
       }
     };
     reader.onerror = () => {
+      setIsLoading(false);
+      setLoadingProgress(null);
       setErrorMessage('Failed to read uploaded file');
     };
     reader.readAsArrayBuffer(file);
+  };
+
+  // Re-run analysis with a new capacity limit
+  const handleChangeCapacityAndReanalyze = (newCapacity: number) => {
+    setPacketCapacity(newCapacity);
+    if (currentBuffer && analysisResult) {
+      processPcapBuffer(currentBuffer, analysisResult.filename, newCapacity);
+    }
   };
 
   // Download currently loaded PCAP as binary file
@@ -147,28 +275,13 @@ export function App() {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* Drag & Drop Visual Overlay */}
-      {isDraggingOver && (
-        <div className="fixed inset-0 bg-slate-950/90 border-4 border-dashed border-cyan-400 z-50 flex items-center justify-center p-6 backdrop-blur-md">
-          <div className="text-center space-y-3">
-            <div className="w-16 h-16 rounded-2xl bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center mx-auto text-cyan-400 animate-bounce">
-              <Upload className="w-8 h-8" />
-            </div>
-            <h3 className="text-xl font-bold text-white">Drop PCAP file to inspect</h3>
-            <p className="text-sm text-slate-400 font-mono">
-              Supports standard Libpcap (.pcap), PCAP Next Generation (.pcapng), and TCPDump (.cap)
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Main App Navigation */}
+      {/* Top Navigation */}
       <Navbar
-        currentFilename={analysisResult?.filename || 'No capture loaded'}
+        currentFilename={analysisResult?.filename || ''}
         packetCount={analysisResult?.parsedPackets.length || 0}
         unencryptedCount={analysisResult?.cleartextItems.length || 0}
         anomalyCount={analysisResult?.anomalies.length || 0}
-        hasCapture={Boolean(analysisResult)}
+        hasCapture={!!analysisResult}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         onFileUpload={handleFileUpload}
@@ -178,20 +291,26 @@ export function App() {
         onClearCapture={handleClearCapture}
       />
 
-      {/* Main Content Area */}
+      {/* Drag & Drop Visual Overlay */}
+      {isDraggingOver && (
+        <div className="fixed inset-0 z-50 bg-cyan-950/80 border-4 border-dashed border-cyan-400 backdrop-blur-sm flex flex-col items-center justify-center pointer-events-none p-6 text-center">
+          <Upload className="w-16 h-16 text-cyan-400 mb-4 animate-bounce" />
+          <h2 className="text-2xl font-bold text-white mb-2">Drop PCAP File to Analyze</h2>
+          <p className="text-cyan-200 text-sm font-mono">Supports .pcap and .pcapng captures of any scale without UI freezing</p>
+        </div>
+      )}
+
+      {/* Main Body */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
         
-        {/* Error Notification */}
+        {/* Error Alert */}
         {errorMessage && (
-          <div className="mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-start justify-between gap-3 text-rose-300 text-xs">
-            <div className="flex items-start gap-3">
-              <FileWarning className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+          <div className="mb-6 bg-rose-950/80 border border-rose-800 text-rose-200 p-4 rounded-xl flex items-center justify-between gap-3 shadow-lg">
+            <div className="flex items-center gap-3">
+              <FileWarning className="w-5 h-5 text-rose-400 shrink-0" />
               <div>
-                <p className="font-bold text-sm">Failed to parse packet capture</p>
-                <p className="mt-0.5">{errorMessage}</p>
-                <p className="mt-1 text-slate-400">
-                  Ensure the file is a valid PCAP/PCAPNG capture. Alternatively, test the application with one of our pre-built forensic scenarios below.
-                </p>
+                <p className="text-sm font-semibold">PCAP Processing Error</p>
+                <p className="text-xs text-rose-300 font-mono mt-0.5">{errorMessage}</p>
               </div>
             </div>
             <button
@@ -204,31 +323,101 @@ export function App() {
           </div>
         )}
 
-        {/* Loading Spinner */}
+        {/* Loading Spinner & Progress Status */}
         {isLoading && (
-          <div className="py-24 text-center space-y-4">
-            <Loader2 className="w-10 h-10 text-cyan-400 animate-spin mx-auto" />
-            <div className="space-y-1">
-              <h3 className="text-base font-semibold text-white">Analyzing Packet Stream</h3>
-              <p className="text-xs text-slate-400 font-mono">
-                Decoding Ethernet/IP/TCP frames, extracting unencrypted credentials, and running anomaly heuristics...
-              </p>
+          <div className="py-16 max-w-xl mx-auto space-y-6 animate-in fade-in duration-200">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-8 shadow-2xl shadow-slate-950 space-y-5 text-center">
+              <div className="relative w-16 h-16 mx-auto flex items-center justify-center">
+                <div className="absolute inset-0 rounded-full border-4 border-slate-800 border-t-cyan-400 animate-spin" />
+                <Cpu className="w-7 h-7 text-cyan-400" />
+              </div>
+
+              <div className="space-y-1.5">
+                <h3 className="text-lg font-bold text-white font-sans tracking-tight">
+                  {loadingProgress?.stage === 'reading' && 'Reading PCAP File...'}
+                  {loadingProgress?.stage === 'parsing' && 'Decoding PCAP Frames (Non-Blocking)...'}
+                  {loadingProgress?.stage === 'scanning' && 'Scanning for Cleartext Secrets...'}
+                  {loadingProgress?.stage === 'anomalies' && 'Analyzing Security Threats...'}
+                  {loadingProgress?.stage === 'stats' && 'Compiling Traffic Timeline...'}
+                  {(!loadingProgress || loadingProgress?.stage === 'ready') && 'Analyzing Packet Stream...'}
+                </h3>
+                <p className="text-xs text-slate-400 font-mono">
+                  {loadingProgress?.message || 'Processing capture frames asynchronously without UI thread locks...'}
+                </p>
+              </div>
+
+              {/* Progress Bar */}
+              <div className="space-y-2">
+                <div className="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
+                  <div 
+                    className="bg-gradient-to-r from-cyan-500 via-indigo-500 to-emerald-400 h-full transition-all duration-300 rounded-full"
+                    style={{ width: `${Math.max(5, loadingProgress?.percent || 5)}%` }}
+                  />
+                </div>
+                <div className="flex justify-between items-center text-[11px] font-mono text-slate-500">
+                  <span className="flex items-center gap-1.5 text-slate-400">
+                    <Zap className="w-3 h-3 text-cyan-400" />
+                    <span>{loadingProgress?.packetsCount ? `${loadingProgress.packetsCount.toLocaleString()} frames indexed` : '0-copy memory pipeline'}</span>
+                  </span>
+                  <span className="font-semibold text-cyan-400">{loadingProgress?.percent || 0}%</span>
+                </div>
+              </div>
+
+              {/* Cancel Button */}
+              <div className="pt-2">
+                <button
+                  type="button"
+                  onClick={handleClearCapture}
+                  className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-mono border border-slate-700 transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  <span>Cancel Analysis</span>
+                </button>
+              </div>
             </div>
           </div>
         )}
 
         {/* Initial Screen: File Upload + Forensic Scenario Chooser */}
         {!isLoading && !analysisResult && (
-          <div className="py-8 space-y-10 max-w-5xl mx-auto animate-in fade-in duration-200">
+          <div className="py-8 space-y-8 max-w-5xl mx-auto animate-in fade-in duration-200">
             
             {/* Hero / Upload Box */}
             <div className="text-center space-y-3">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-950/60 border border-cyan-800/60 text-cyan-300 text-xs font-mono mb-2">
+                <Zap className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Zero-Freeze Non-Blocking Engine • Handles 100,000+ to 500,000+ Packets</span>
+              </div>
               <h2 className="text-2xl sm:text-3xl font-bold text-white tracking-tight font-sans">
                 PCAP Cleartext &amp; Forensic Analyzer
               </h2>
               <p className="text-sm text-slate-400 max-w-2xl mx-auto leading-relaxed">
-                Scan network packet captures for unencrypted passwords, HTTP Basic Auth, API tokens, sensitive PII, and security anomalies.
+                Scan network packet captures for unencrypted passwords, HTTP Basic Auth, API tokens, sensitive PII, and security anomalies at high scale.
               </p>
+            </div>
+
+            {/* Capacity Limit Selector Bar */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-md">
+              <div className="flex items-center gap-2.5 text-xs text-slate-300">
+                <Gauge className="w-4 h-4 text-cyan-400" />
+                <span className="font-semibold text-white">Capture Capacity Target:</span>
+                <span className="text-slate-400 hidden sm:inline">Set max frames to index without browser lag:</span>
+              </div>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {CAPACITY_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    onClick={() => setPacketCapacity(opt.value)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-mono transition-all cursor-pointer ${
+                      packetCapacity === opt.value
+                        ? 'bg-cyan-500 text-slate-950 font-bold shadow-md shadow-cyan-500/20'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700'
+                    }`}
+                  >
+                    {opt.label.split(' ')[0]}
+                  </button>
+                ))}
+              </div>
             </div>
 
             {/* Drag & Drop Upload Zone */}
@@ -255,7 +444,7 @@ export function App() {
                   Drop your PCAP file here, or <span className="text-cyan-400 underline underline-offset-2">browse files</span>
                 </p>
                 <p className="text-xs text-slate-400 font-mono">
-                  Supports Libpcap (.pcap), Wireshark NextGen (.pcapng), and TCPDump (.cap)
+                  Supports Libpcap (.pcap), Wireshark NextGen (.pcapng), and TCPDump (.cap) up to 500,000+ packets
                 </p>
               </div>
             </div>
@@ -316,6 +505,43 @@ export function App() {
         {!isLoading && analysisResult && (
           <div className="space-y-6">
             
+            {/* Capture Notification Banner */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-xs font-mono text-slate-300 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-sm">
+              <div className="flex items-center gap-2.5">
+                <Zap className="w-4 h-4 text-cyan-400 shrink-0" />
+                <span>
+                  <strong className="text-white font-semibold">{analysisResult.parsedPackets.length.toLocaleString()} frames</strong> analyzed from{' '}
+                  <span className="text-cyan-300 font-semibold">{analysisResult.filename}</span> ({formatFileSize(analysisResult.fileSize)}).
+                  {analysisResult.truncated && (
+                    <span className="text-amber-300 ml-1">
+                      (Triaged first {analysisResult.parsedPackets.length.toLocaleString()} of {analysisResult.totalPacketsInCapture?.toLocaleString()} total capture frames).
+                    </span>
+                  )}
+                </span>
+              </div>
+
+              {/* Quick Capacity Switcher */}
+              <div className="flex items-center gap-2 self-end md:self-auto shrink-0">
+                <span className="text-slate-500 text-[11px]">Capacity:</span>
+                <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
+                  {CAPACITY_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      onClick={() => handleChangeCapacityAndReanalyze(opt.value)}
+                      title={`Re-analyze with capacity up to ${opt.value.toLocaleString()} frames`}
+                      className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors cursor-pointer ${
+                        packetCapacity === opt.value
+                          ? 'bg-cyan-500 text-slate-950 font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {opt.label.split(' ')[0]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             {/* Top Metric Cards */}
             <SummaryCards
               stats={analysisResult.stats}

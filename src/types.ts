@@ -109,6 +109,7 @@ export interface CleartextItem {
   timestamp: number;
   riskLevel: 'critical' | 'high' | 'medium' | 'low';
   contextSnippet: string;
+  occurrenceCount?: number;
 }
 
 export type AnomalySeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -180,6 +181,14 @@ export interface TrafficStats {
   }[];
 }
 
+export interface AnalysisProgress {
+  stage: 'reading' | 'parsing' | 'scanning' | 'anomalies' | 'stats' | 'ready';
+  percent: number;
+  message: string;
+  packetsCount?: number;
+  totalEstimatedPackets?: number;
+}
+
 export interface AnalysisResult {
   filename: string;
   fileSize: number;
@@ -187,6 +196,8 @@ export interface AnalysisResult {
   cleartextItems: CleartextItem[];
   anomalies: SecurityAnomaly[];
   stats: TrafficStats;
+  truncated?: boolean;
+  totalPacketsInCapture?: number;
 }
 
 export interface PcapParseResult {
@@ -196,4 +207,6 @@ export interface PcapParseResult {
   cleartextItems: CleartextItem[];
   anomalies: SecurityAnomaly[];
   stats: TrafficStats;
+  truncated?: boolean;
+  totalPacketsInCapture?: number;
 }
